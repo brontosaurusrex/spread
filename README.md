@@ -1,6 +1,7 @@
-Usage example
+Usage examples
 
     bat -p --color always main.go  | spread
+    spread -cols 3 book.txt
 
 keys
 
