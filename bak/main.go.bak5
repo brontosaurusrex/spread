@@ -1,0 +1,383 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
+	"golang.org/x/term"
+)
+
+const (
+	sepStr = "   "
+	sepWid = 3
+)
+
+type Chunk struct {
+	Text  string
+	Width int
+}
+
+type Pager struct {
+	rawLines     []string
+	displayLines []Chunk
+	numCols      int
+	termWidth    int
+	termHeight   int
+	colWidth     int
+	offset       int
+	prevOffset   int
+	fullRedraw   bool
+	quit         bool
+	resize       bool
+	oldTermState *term.State
+	tty          *os.File
+}
+
+func main() {
+	cols := flag.Int("cols", 2, "Initial number of columns")
+	flag.Parse()
+
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cannot open terminal: %v\n", err)
+		os.Exit(1)
+	}
+	defer tty.Close()
+
+	p := &Pager{
+		numCols:    *cols,
+		tty:        tty,
+		fullRedraw: true,
+	}
+
+	if flag.NArg() > 0 {
+		f, err := os.Open(flag.Arg(0))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening file: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		p.readInput(f)
+	} else {
+		p.readInput(os.Stdin)
+	}
+
+	if len(p.rawLines) == 0 {
+		return
+	}
+
+	os.Stdout.WriteString("\x1b[?1049h\x1b[?25l")
+	defer func() {
+		os.Stdout.WriteString("\x1b[?25h\x1b[?1049l")
+	}()
+
+	oldState, err := term.MakeRaw(int(p.tty.Fd()))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to set raw mode: %v\n", err)
+		os.Exit(1)
+	}
+	defer term.Restore(int(p.tty.Fd()), oldState)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		p.quit = true
+	}()
+
+	resizeChan := make(chan os.Signal, 1)
+	signal.Notify(resizeChan, syscall.SIGWINCH)
+	go func() {
+		for range resizeChan {
+			p.resize = true
+		}
+	}()
+
+	p.updateSize()
+
+	for !p.quit {
+		p.render()
+		p.handleKey()
+	}
+}
+
+func (p *Pager) readInput(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		p.rawLines = append(p.rawLines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+	}
+}
+
+func (p *Pager) updateSize() {
+	width, height, err := term.GetSize(int(p.tty.Fd()))
+	if err != nil {
+		return
+	}
+	if width < 10 || height < 3 {
+		width = 80
+		height = 24
+	}
+	p.termWidth = width
+	p.termHeight = height
+	p.resize = false
+	p.fullRedraw = true
+	p.computeColumnWidth()
+	p.wrapLines()
+}
+
+func (p *Pager) computeColumnWidth() {
+	totalSepWidth := (p.numCols - 1) * sepWid
+	available := p.termWidth - totalSepWidth - 1 // safety margin
+	if available < p.numCols {
+		available = p.numCols
+	}
+	p.colWidth = available / p.numCols
+	if p.colWidth < 1 {
+		p.colWidth = 1
+	}
+}
+
+func (p *Pager) wrapLines() {
+	p.displayLines = []Chunk{}
+	for _, raw := range p.rawLines {
+		chunks := splitIntoChunks(raw, p.colWidth)
+		p.displayLines = append(p.displayLines, chunks...)
+	}
+
+	maxOffset := len(p.displayLines) - (p.numCols * p.termHeight)
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if p.offset > maxOffset {
+		p.offset = maxOffset
+	}
+}
+
+func splitIntoChunks(s string, maxWidth int) []Chunk {
+	if maxWidth <= 0 {
+		return []Chunk{{Text: s, Width: 0}}
+	}
+
+	var chunks []Chunk
+	var buf strings.Builder
+	currentWidth := 0
+	i := 0
+	n := len(s)
+
+	for i < n {
+		if s[i] == '\x1b' && i+1 < n && s[i+1] == '[' {
+			j := i + 2
+			for j < n {
+				c := s[j]
+				if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+					break
+				}
+				j++
+			}
+			if j < n {
+				j++
+			}
+			buf.WriteString(s[i:j])
+			i = j
+			continue
+		}
+
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError {
+			buf.WriteByte(s[i])
+			currentWidth++
+			i++
+			continue
+		}
+
+		runeW := runewidth.RuneWidth(r)
+		if currentWidth+runeW > maxWidth && currentWidth > 0 {
+			chunks = append(chunks, Chunk{Text: buf.String(), Width: currentWidth})
+			buf.Reset()
+			currentWidth = 0
+			continue
+		}
+
+		buf.WriteString(s[i : i+size])
+		currentWidth += runeW
+		i += size
+	}
+
+	if buf.Len() > 0 || len(chunks) == 0 {
+		chunks = append(chunks, Chunk{Text: buf.String(), Width: currentWidth})
+	}
+	return chunks
+}
+
+// drawRow returns the content for one row, including clearing, padding, and separators.
+// Does NOT include newline.
+func (p *Pager) drawRow(row int) string {
+	var sb strings.Builder
+	sb.WriteString("\x1b[G") // move to column 1
+	sb.WriteString("\x1b[K") // clear entire line
+
+	totalLines := len(p.displayLines)
+	cols := p.numCols
+	height := p.termHeight
+
+	for col := 0; col < cols; col++ {
+		idx := p.offset + (col * height) + row
+		if idx < totalLines {
+			chunk := p.displayLines[idx]
+			sb.WriteString(chunk.Text)
+			sb.WriteString("\x1b[0m")
+			padding := p.colWidth - chunk.Width
+			if padding > 0 {
+				sb.WriteString(strings.Repeat(" ", padding))
+			}
+		} else {
+			sb.WriteString(strings.Repeat(" ", p.colWidth))
+		}
+		if col < cols-1 {
+			sb.WriteString(sepStr)
+		}
+	}
+	return sb.String()
+}
+
+// fullRender draws all rows, with newlines between rows but not after last.
+func (p *Pager) fullRender() string {
+	var sb strings.Builder
+	sb.WriteString("\x1b[H") // home cursor
+	for row := 0; row < p.termHeight; row++ {
+		sb.WriteString(p.drawRow(row))
+		if row < p.termHeight-1 {
+			sb.WriteString("\r\n")
+		}
+	}
+	return sb.String()
+}
+
+func (p *Pager) render() {
+	if p.resize {
+		p.updateSize()
+	}
+
+	delta := p.offset - p.prevOffset
+	incremental := (delta == 1 || delta == -1) && !p.fullRedraw && !p.resize
+
+	if incremental {
+		if delta == 1 {
+			// Scroll down: move content up, draw new bottom line
+			os.Stdout.WriteString("\x1b[1S")
+			fmt.Fprintf(os.Stdout, "\x1b[%d;1H", p.termHeight)
+			os.Stdout.WriteString(p.drawRow(p.termHeight - 1))
+		} else { // delta == -1
+			// Scroll up: move content down, draw new top line
+			os.Stdout.WriteString("\x1b[1T")
+			os.Stdout.WriteString("\x1b[1;1H")
+			os.Stdout.WriteString(p.drawRow(0))
+		}
+	} else {
+		os.Stdout.WriteString(p.fullRender())
+		p.fullRedraw = false
+	}
+
+	p.prevOffset = p.offset
+}
+
+func (p *Pager) handleKey() {
+	buf := make([]byte, 8)
+	n, err := p.tty.Read(buf)
+	if err != nil {
+		return
+	}
+	key := string(buf[:n])
+
+	oldOffset := p.offset
+
+	switch {
+	case key == "1":
+		p.numCols = 1
+		p.fullRedraw = true
+		p.computeColumnWidth()
+		p.wrapLines()
+	case key == "2":
+		p.numCols = 2
+		p.fullRedraw = true
+		p.computeColumnWidth()
+		p.wrapLines()
+	case key == "3":
+		p.numCols = 3
+		p.fullRedraw = true
+		p.computeColumnWidth()
+		p.wrapLines()
+
+	case key == "\x1b[A" || key == "\x1bOA":
+		p.offset -= 1
+	case key == "\x1b[B" || key == "\x1bOB":
+		p.offset += 1
+	case key == "\x1b[5~":
+		p.offset -= p.termHeight
+		p.fullRedraw = true
+	case key == "\x1b[6~":
+		p.offset += p.termHeight
+		p.fullRedraw = true
+	case key == "\x1b[H" || key == "\x1bOH":
+		p.offset = 0
+		p.fullRedraw = true
+	case key == "\x1b[F" || key == "\x1bOF":
+		p.offset = len(p.displayLines)
+		p.fullRedraw = true
+	case key == " ":
+		p.offset += p.termHeight
+		p.fullRedraw = true
+	case key == "\n" || key == "\r" || key == "j":
+		p.offset += 1
+	case key == "k":
+		p.offset -= 1
+	case key == "d" || key == "\x04":
+		p.offset += p.termHeight / 2
+		p.fullRedraw = true
+	case key == "u" || key == "\x15":
+		p.offset -= p.termHeight / 2
+		p.fullRedraw = true
+	case key == "g":
+		p.offset = 0
+		p.fullRedraw = true
+	case key == "G":
+		p.offset = len(p.displayLines)
+		p.fullRedraw = true
+	case key == "q" || key == "\x03":
+		p.quit = true
+		return
+	}
+
+	maxOffset := len(p.displayLines) - (p.numCols * p.termHeight)
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if p.offset < 0 {
+		p.offset = 0
+	}
+	if p.offset > maxOffset {
+		p.offset = maxOffset
+	}
+
+	if p.offset != oldOffset && abs(p.offset-oldOffset) != 1 {
+		p.fullRedraw = true
+	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}

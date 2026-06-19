@@ -1,0 +1,151 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+
+	"github.com/mattn/go-runewidth"
+	"golang.org/x/term"
+)
+
+type App struct {
+	lines []string
+
+	offset  int
+	colMode int
+
+	width  int
+	height int
+	rows   int
+	cols   int
+}
+
+// ---------- read stdin ----------
+func readStdin() []string {
+	sc := bufio.NewScanner(os.Stdin)
+	var lines []string
+
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines
+}
+
+// ---------- terminal size ----------
+func (a *App) updateSize() {
+	w, h, _ := term.GetSize(int(os.Stdout.Fd()))
+	a.width = w
+	a.height = h
+
+	if a.colMode < 1 {
+		a.colMode = 1
+	}
+	if a.colMode > 3 {
+		a.colMode = 3
+	}
+
+	a.cols = a.colMode
+	a.rows = h
+}
+
+// ---------- scroll ----------
+func (a *App) scroll(d int) {
+	a.offset += d
+	if a.offset < 0 {
+		a.offset = 0
+	}
+}
+
+// ---------- render ----------
+func (a *App) render() {
+	// clear screen
+	fmt.Print("\033[H\033[2J")
+
+	colW := a.width / a.cols
+
+	for r := 0; r < a.rows; r++ {
+		for c := 0; c < a.cols; c++ {
+
+			i := a.offset + c*a.rows + r
+			if i >= len(a.lines) {
+				continue
+			}
+
+			line := a.lines[i]
+
+			curW := 0
+
+			for _, rr := range line {
+				w := runewidth.RuneWidth(rr)
+
+				if curW+w > colW {
+					break
+				}
+
+				// IMPORTANT:
+				// We output raw text (including ANSI sequences intact)
+				fmt.Printf("%c", rr)
+
+				curW += w
+			}
+
+			// reset style after each cell
+			fmt.Print("\033[0m")
+		}
+
+		fmt.Print("\n")
+	}
+
+	fmt.Print("\033[0m")
+}
+
+// ---------- input loop ----------
+func (a *App) run() {
+	a.updateSize()
+	a.render()
+
+	buf := make([]byte, 1)
+
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil || n == 0 {
+			continue
+		}
+
+		switch buf[0] {
+		case 'q':
+			return
+		case 'j':
+			a.scroll(1)
+		case 'k':
+			a.scroll(-1)
+		case '1':
+			a.colMode = 1
+		case '2':
+			a.colMode = 2
+		case '3':
+			a.colMode = 3
+		}
+
+		a.updateSize()
+		a.render()
+	}
+}
+
+// ---------- main ----------
+func main() {
+	lines := readStdin()
+	if len(lines) == 0 {
+		fmt.Println("no input")
+		return
+	}
+
+	app := &App{
+		lines:   lines,
+		colMode: 2,
+		offset:  0,
+	}
+
+	app.run()
+}

@@ -1,0 +1,198 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/mattn/go-runewidth"
+)
+
+type App struct {
+	screen tcell.Screen
+
+	lines []string
+
+	offset  int
+	colMode int // 1–3
+
+	rows int
+	cols int
+}
+
+func readStdin() []string {
+	sc := bufio.NewScanner(os.Stdin)
+	lines := make([]string, 0, 1024)
+
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines
+}
+
+func (a *App) updateSize() {
+	_, h := a.screen.Size()
+	a.rows = h
+
+	if a.colMode < 1 {
+		a.colMode = 1
+	}
+	if a.colMode > 3 {
+		a.colMode = 3
+	}
+
+	a.cols = a.colMode
+}
+
+func (a *App) scroll(delta int) {
+	a.offset += delta
+	if a.offset < 0 {
+		a.offset = 0
+	}
+}
+
+func (a *App) draw() {
+	a.screen.Clear()
+
+	w, h := a.screen.Size()
+	_ = h
+
+	if a.cols < 1 {
+		a.cols = 1
+	}
+
+	colWidth := w / a.cols
+
+	for c := 0; c < a.cols; c++ {
+		base := a.offset + c*a.rows
+
+		for r := 0; r < a.rows; r++ {
+			i := base + r
+			if i >= len(a.lines) {
+				continue
+			}
+
+			line := a.lines[i]
+
+			x := c * colWidth
+			y := r
+
+			curX := 0
+			for _, rr := range line {
+				rw := runewidth.RuneWidth(rr)
+
+				if curX+rw > colWidth {
+					break
+				}
+
+				style := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+
+				a.screen.SetContent(
+					x+curX,
+					y,
+					rr,
+					nil,
+					style,
+				)
+
+				curX += rw
+			}
+		}
+	}
+
+	a.screen.Show()
+}
+
+func (a *App) run() error {
+	s, err := tcell.NewScreen()
+	if err != nil {
+		return err
+	}
+	if err := s.Init(); err != nil {
+		return err
+	}
+	defer s.Fini()
+
+	a.screen = s
+
+	a.updateSize()
+	a.draw()
+
+	for {
+		ev := s.PollEvent()
+
+		switch e := ev.(type) {
+
+		case *tcell.EventResize:
+			a.updateSize()
+			a.draw()
+
+		case *tcell.EventKey:
+			switch e.Key() {
+
+			case tcell.KeyEsc, tcell.KeyCtrlC:
+				return nil
+
+			case tcell.KeyUp:
+				a.scroll(-1)
+
+			case tcell.KeyDown:
+				a.scroll(1)
+
+			case tcell.KeyLeft:
+				a.colMode--
+				if a.colMode < 1 {
+					a.colMode = 1
+				}
+				a.updateSize()
+
+			case tcell.KeyRight:
+				a.colMode++
+				if a.colMode > 3 {
+					a.colMode = 3
+				}
+				a.updateSize()
+			}
+
+			switch e.Rune() {
+			case 'q':
+				return nil
+			case 'j':
+				a.scroll(1)
+			case 'k':
+				a.scroll(-1)
+			case '1':
+				a.colMode = 1
+				a.updateSize()
+			case '2':
+				a.colMode = 2
+				a.updateSize()
+			case '3':
+				a.colMode = 3
+				a.updateSize()
+			}
+
+			a.draw()
+		}
+	}
+}
+
+func main() {
+	lines := readStdin()
+
+	if len(lines) == 0 {
+		fmt.Println("no input")
+		return
+	}
+
+	app := &App{
+		lines:   lines,
+		colMode: 2,
+		offset:  0,
+	}
+
+	if err := app.run(); err != nil {
+		fmt.Println("error:", err)
+	}
+}
