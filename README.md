@@ -8,3 +8,7 @@ keys
     g         top
     G         bottom
     q         quit
+
+scrot
+
+![spread](/scrot/spread3columns.png)
